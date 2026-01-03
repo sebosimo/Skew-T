@@ -1,21 +1,37 @@
 name: Daily Weather Plot
+
 on:
-  workflow_dispatch:  # This adds a manual "Run" button
+  workflow_dispatch:  # This adds the manual "Run" button to your Actions tab
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *' # Automatically runs at 06:00 UTC daily
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v2
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run script
-        run: python generate_skewt.py
-      - name: Upload Plot
-        uses: actions/upload-artifact@v2
+        uses: actions/setup-python@v5
         with:
-          name: weather-plots
+          python-version: '3.11' # Recommended for meteodata-lab
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev # Required to read GRIB2 files
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install metpy xarray cfgrib meteodata-lab pandas matplotlib
+
+      - name: Run Skew-T Script
+        run: python generate_skewt.py
+
+      - name: Upload Generated Plot
+        uses: actions/upload-artifact@v4
+        with:
+          name: skewt-plot
           path: "*.png"
