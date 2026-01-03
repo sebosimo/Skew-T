@@ -6,111 +6,111 @@ from meteodatalab import ogd_api
 import xarray as xr
 import numpy as np
 import datetime
+import os
 
 # --- Configuration ---
 LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
 CORE_VARS = ["T", "U", "V", "P"] 
+FORECAST_STEPS = range(0, 27, 3) # 0, 3, 6, ..., 24 hours
 
 def get_nearest_profile(ds, lat_target, lon_target):
-    """Correctly extracts a vertical profile from regular or native ICON grids."""
+    """Robustly extracts a vertical profile from the horizontal grid."""
     if ds is None: return None
     data = ds if isinstance(ds, xr.DataArray) else ds[list(ds.data_vars)[0]]
-    
-    # 1. Identify coordinate and dimension names
     lat_coord = 'latitude' if 'latitude' in data.coords else 'lat'
     lon_coord = 'longitude' if 'longitude' in data.coords else 'lon'
-    
-    # 2. Find the horizontal dimension (usually 'ncells' or 'grid_index')
     horiz_dims = data.coords[lat_coord].dims
-    
-    # 3. Calculate distance to find the closest horizontal point
     dist = (data[lat_coord] - lat_target)**2 + (data[lon_coord] - lon_target)**2
     flat_idx = dist.argmin().values
-    
-    # 4. Extract column: select the index on the horizontal dimension only
-    # This keeps all levels in the vertical dimension(s)
     if len(horiz_dims) == 1:
-        # Native ICON Grid (1D horizontal)
         profile = data.isel({horiz_dims[0]: flat_idx})
     else:
-        # Regular Grid (2D horizontal)
         profile = data.stack(gp=horiz_dims).isel(gp=flat_idx)
-        
     return profile.squeeze().compute()
 
 def main():
-    print("Fetching ICON-CH1 data from MeteoSwiss...")
+    print("Connecting to MeteoSwiss for ICON-CH1 Forecast Series...")
     now = datetime.datetime.now(datetime.timezone.utc)
     base_hour = (now.hour // 3) * 3
     latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
-    # Try the last 4 runs to find complete data
+    # Strategy: Find a complete run initialization first
     times_to_try = [latest_run - datetime.timedelta(hours=i*3) for i in range(4)]
     
-    success, profile_data, ref_time_final = False, {}, None
+    selected_run = None
     for ref_time in times_to_try:
-        print(f"--- Attempting Run: {ref_time.strftime('%H:%M')} UTC ---")
+        # Check if the most essential variable (T) exists for the final step (+24h)
+        # If +24h is available, the whole run is likely ready
         try:
+            req_test = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable="T",
+                                       reference_datetime=ref_time, horizon="P0DT24H", perturbed=False)
+            if ogd_api.get_from_ogd(req_test) is not None:
+                selected_run = ref_time
+                break
+        except: continue
+
+    if not selected_run:
+        print("Error: No complete model runs with 24h forecasts found.")
+        return
+
+    print(f"Generating sequence for Model Run: {selected_run.strftime('%H:%M')} UTC")
+
+    for step in FORECAST_STEPS:
+        horizon_str = f"P0DT{step}H"
+        print(f"Processing Forecast Step: +{step}h ({horizon_str})...")
+        
+        try:
+            profile_data = {}
             for var in CORE_VARS:
                 req = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=var,
-                                      reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
-                res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
-                if res is None or res.size < 5: raise ValueError(f"Empty {var}")
-                profile_data[var] = res
+                                      reference_datetime=selected_run, horizon=horizon_str, perturbed=False)
+                profile_data[var] = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
             
-            # Fetch Humidity with fallback
             for hum_var in ["RELHUM", "QV"]:
                 try:
                     req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
-                                            reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
-                    res_h = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
-                    if res_h is not None and res_h.size >= 5:
-                        profile_data["HUM"], profile_data["HUM_TYPE"] = res_h, hum_var
-                        break
+                                            reference_datetime=selected_run, horizon=horizon_str, perturbed=False)
+                    profile_data["HUM"] = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
+                    profile_data["HUM_TYPE"] = hum_var
+                    break
                 except: continue
+
+            # --- Plotting ---
+            p = profile_data["P"].values * units.Pa
+            t = profile_data["T"].values * units.K
+            if profile_data["HUM_TYPE"] == "RELHUM":
+                td = mpcalc.dewpoint_from_relative_humidity(t, profile_data["HUM"].values / 100.0)
+            else:
+                td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
+
+            inds = p.argsort()[::-1]
+            p, t, td = p[inds], t[inds], td[inds]
+
+            fig = plt.figure(figsize=(10, 12))
+            skew = SkewT(fig, rotation=45)
+            skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temp')
+            skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
+            skew.plot_barbs(p.to(units.hPa)[::3], profile_data["U"].values[inds][::3], profile_data["V"].values[inds][::3])
             
-            if "HUM" not in profile_data: raise ValueError("No Humidity")
-            success, ref_time_final = True, ref_time
-            break 
-        except Exception as e: print(f"Run incomplete: {e}")
+            skew.plot_dry_adiabats(alpha=0.1, color='red')
+            skew.plot_moist_adiabats(alpha=0.1, color='blue')
+            skew.plot_mixing_lines(alpha=0.1, color='green')
+            
+            skew.ax.set_ylim(1050, 100)
+            skew.ax.set_xlim(-40, 40)
+            
+            valid_time = selected_run + datetime.timedelta(hours=step)
+            plt.title(f"ICON-CH1 | Run: {selected_run.strftime('%H:%M')} | Forecast: +{step}h\nValid: {valid_time.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=14)
+            plt.legend(loc='upper left')
+            
+            # Save file with step index
+            plt.savefig(f"skewt_f{step:02d}.png", bbox_inches='tight', dpi=120)
+            plt.close() # Important: close plot to save memory
+            
+        except Exception as e:
+            print(f"Failed step +{step}h: {e}")
 
-    if not success:
-        print("Error: No complete model runs found.")
-        return
-
-    # --- Unit Conversion & Sorting ---
-    # Sort ground-to-sky by pressure for correct rendering
-    p = profile_data["P"].values * units.Pa
-    t = profile_data["T"].values * units.K
-    u = profile_data["U"].values * units('m/s')
-    v = profile_data["V"].values * units('m/s')
-    
-    if profile_data["HUM_TYPE"] == "RELHUM":
-        td = mpcalc.dewpoint_from_relative_humidity(t, profile_data["HUM"].values / 100.0)
-    else:
-        td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
-
-    inds = p.argsort()[::-1] # Sort descending (1000hPa -> 100hPa)
-    p, t, td, u, v = p[inds], t[inds], td[inds], u[inds], v[inds]
-
-    # --- Plotting ---
-    fig = plt.figure(figsize=(10, 12))
-    skew = SkewT(fig, rotation=45)
-    
-    skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
-    skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa)[::3], u[::3], v[::3]) # Decimate for clarity
-    
-    skew.plot_dry_adiabats(alpha=0.1, color='red')
-    skew.plot_moist_adiabats(alpha=0.1, color='blue')
-    skew.plot_mixing_lines(alpha=0.1, color='green')
-    
-    skew.ax.set_ylim(1050, 100)
-    skew.ax.set_xlim(-40, 40)
-    plt.title(f"ICON-CH1 Sounding | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=14)
-    plt.legend(loc='upper left')
-    plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
-    print("Success! Skew-T saved.")
+    print("Success! Generated forecast sequence.")
 
 if __name__ == "__main__":
     main()
