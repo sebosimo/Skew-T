@@ -7,6 +7,7 @@ import xarray as xr
 import numpy as np
 import datetime
 import matplotlib.gridspec as gridspec
+import matplotlib.ticker as ticker
 
 # --- Configuration ---
 LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
@@ -28,26 +29,24 @@ def get_nearest_profile(ds, lat_target, lon_target):
     dist = (data[lat_coord] - lat_target)**2 + (data[lon_coord] - lon_target)**2
     flat_idx = dist.argmin().values
     
-    # 4. Extract column: select the index on the horizontal dimension only
+    # 4. Extract column
     if len(horiz_dims) == 1:
-        # Native ICON Grid (1D horizontal)
         profile = data.isel({horiz_dims[0]: flat_idx})
     else:
-        # Regular Grid (2D horizontal)
         profile = data.stack(gp=horiz_dims).isel(gp=flat_idx)
         
     return profile.squeeze().compute()
 
-# --- Axis Conversion Functions (Standard Atmosphere) ---
+# --- Axis Conversion Helpers ---
+# We use log-pressure for the mapping to standard atmosphere height
 def p_to_h(p):
-    """Convert pressure (hPa) to height (m) using Standard Atmosphere."""
-    # Ensure input is treated as hPa and return unitless meters
-    return mpcalc.pressure_to_height_std(p * units.hPa).m_as(units.m)
+    """Convert pressure (hPa) to height (m) for axis ticks."""
+    # Standard Atmosphere approximation
+    return (44330 * (1 - (p / 1013.25)**(1/5.255)))
 
 def h_to_p(h):
-    """Convert height (m) to pressure (hPa) using Standard Atmosphere."""
-    # Ensure input is treated as meters and return unitless hPa
-    return mpcalc.height_to_pressure_std(h * units.m).m_as(units.hPa)
+    """Convert height (m) to pressure (hPa) for axis ticks."""
+    return (1013.25 * (1 - h / 44330)**5.255)
 
 def main():
     print("Fetching ICON-CH1 data from MeteoSwiss...")
@@ -55,7 +54,6 @@ def main():
     base_hour = (now.hour // 3) * 3
     latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
-    # Try the last 4 runs to find complete data
     times_to_try = [latest_run - datetime.timedelta(hours=i*3) for i in range(4)]
     
     success, profile_data, ref_time_final = False, {}, None
@@ -69,7 +67,7 @@ def main():
                 if res is None or res.size < 5: raise ValueError(f"Empty {var}")
                 profile_data[var] = res
             
-            # Fetch Humidity with fallback
+            # Fetch Humidity
             for hum_var in ["RELHUM", "QV"]:
                 try:
                     req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
@@ -89,7 +87,7 @@ def main():
         print("Error: No complete model runs found.")
         return
 
-    # --- Unit Conversion & Sorting ---
+    # --- Unit Conversion ---
     p = profile_data["P"].values * units.Pa
     t = profile_data["T"].values * units.K
     u = profile_data["U"].values * units('m/s')
@@ -103,13 +101,15 @@ def main():
     else:
         td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
 
-    inds = p.argsort()[::-1] # Sort descending (1000hPa -> 100hPa)
+    inds = p.argsort()[::-1]
     p, t, td, u, v, wind_speed = p[inds], t[inds], td[inds], u[inds], v[inds], wind_speed[inds]
 
     # --- Plotting ---
-    # Setup Figure and Grid (SkewT on left, Wind Speed on right)
-    fig = plt.figure(figsize=(14, 12))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1], wspace=0.1)
+    # We increase width slightly but keep ratios to preserve the skew look
+    fig = plt.figure(figsize=(11, 10)) 
+    
+    # GridSpec: 4 parts for SkewT, 1 part for Wind
+    gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0.05)
     
     # 1. Skew-T Panel
     ax_skew = fig.add_subplot(gs[0])
@@ -120,37 +120,53 @@ def main():
     skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
     skew.plot_barbs(p.to(units.hPa)[::3], u[::3], v[::3])
     
-    # Skew-T Decorations
+    # Decorations
     skew.plot_dry_adiabats(alpha=0.1, color='red')
     skew.plot_moist_adiabats(alpha=0.1, color='blue')
     skew.plot_mixing_lines(alpha=0.1, color='green')
     
+    # Set Limits (Standard 1050-100 hPa)
     skew.ax.set_ylim(1050, 100)
     skew.ax.set_xlim(-40, 40)
     
-    # --- Modify Axis: Altitude instead of Pressure ---
-    # Hide original pressure labels
+    # --- Altitude Axis (Left) ---
+    # Hide the default pressure labels on the left
     skew.ax.yaxis.set_major_formatter(plt.NullFormatter())
+    skew.ax.set_ylabel("") # Remove 'hPa' label
     
-    # Create Secondary Axis for Altitude (Meters) on the left
-    # functions=(forward, inverse) maps Pressure <-> Height
+    # Create the secondary axis for meters
+    # We use the conversion functions defined above
     secax = skew.ax.secondary_yaxis('left', functions=(p_to_h, h_to_p))
     secax.set_ylabel('Altitude [m]', fontsize=12)
-    secax.tick_params(axis='y', length=6, width=1)
     
+    # Force specific ticks to ensure they appear
+    # We generate ticks from 0m to 16000m every 1000m or 2000m
+    alt_ticks = np.arange(0, 17000, 1000)
+    secax.set_yticks(alt_ticks)
+    secax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
+    secax.tick_params(axis='y', length=6, direction='out')
+
     plt.title(f"ICON-CH1 Sounding | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=14)
     skew.ax.legend(loc='upper left')
 
     # 2. Wind Speed Panel (Right)
+    # sharey ensures the vertical axis (Pressure) matches exactly
     ax_wind = fig.add_subplot(gs[1], sharey=skew.ax)
+    
+    # Plot wind speed (X) vs Pressure (Y)
     ax_wind.plot(wind_speed, p.to(units.hPa), 'b-', linewidth=2)
-    ax_wind.set_xlabel('Wind Speed [km/h]', fontsize=12)
+    
+    # Setup Wind Axis
+    ax_wind.set_xlabel('Wind [km/h]', fontsize=10)
     ax_wind.grid(True)
     
-    # Hide Y-axis labels for wind plot (since it shares with Skew-T)
+    # Hide Y-axis labels/ticks on the wind plot (it shares the Skew-T's scale)
     plt.setp(ax_wind.get_yticklabels(), visible=False)
     
-    # Final adjustments
+    # Optional: Add a few minor ticks or gridlines for wind clarity
+    ax_wind.xaxis.set_major_locator(ticker.MaxNLocator(nbins=4))
+
+    # Save
     plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
     print("Success! Skew-T saved.")
 
