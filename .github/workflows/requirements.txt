@@ -1,0 +1,4 @@
+metpy
+xarray
+cfgrib
+requests
