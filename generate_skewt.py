@@ -22,10 +22,10 @@ def get_nearest_profile(ds, lat_target, lon_target):
     lat_coord = 'latitude' if 'latitude' in data.coords else 'lat'
     lon_coord = 'longitude' if 'longitude' in data.coords else 'lon'
     
-    # 2. Find the horizontal dimension (usually 'ncells' or 'grid_index')
+    # 2. Find the horizontal dimension
     horiz_dims = data.coords[lat_coord].dims
     
-    # 3. Calculate distance to find the closest horizontal point
+    # 3. Calculate distance
     dist = (data[lat_coord] - lat_target)**2 + (data[lon_coord] - lon_target)**2
     flat_idx = dist.argmin().values
     
@@ -37,15 +37,14 @@ def get_nearest_profile(ds, lat_target, lon_target):
         
     return profile.squeeze().compute()
 
-# --- Axis Conversion Helpers ---
-# We use log-pressure for the mapping to standard atmosphere height
+# --- Axis Conversion Functions (Standard Atmosphere) ---
 def p_to_h(p):
-    """Convert pressure (hPa) to height (m) for axis ticks."""
-    # Standard Atmosphere approximation
+    """Convert pressure (hPa) to height (m)."""
+    # 44330m is approx height where p goes to 0 in std atm model
     return (44330 * (1 - (p / 1013.25)**(1/5.255)))
 
 def h_to_p(h):
-    """Convert height (m) to pressure (hPa) for axis ticks."""
+    """Convert height (m) to pressure (hPa)."""
     return (1013.25 * (1 - h / 44330)**5.255)
 
 def main():
@@ -54,6 +53,7 @@ def main():
     base_hour = (now.hour // 3) * 3
     latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
+    # Try last 4 runs
     times_to_try = [latest_run - datetime.timedelta(hours=i*3) for i in range(4)]
     
     success, profile_data, ref_time_final = False, {}, None
@@ -105,44 +105,37 @@ def main():
     p, t, td, u, v, wind_speed = p[inds], t[inds], td[inds], u[inds], v[inds], wind_speed[inds]
 
     # --- Plotting ---
-    # We increase width slightly but keep ratios to preserve the skew look
-    fig = plt.figure(figsize=(11, 10)) 
+    # use a roughly square aspect for the skew-t part to prevent visual "over-tilting"
+    fig = plt.figure(figsize=(10, 9)) 
     
-    # GridSpec: 4 parts for SkewT, 1 part for Wind
-    gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0.05)
+    # width_ratios=[4, 1] gives the skew-t 80% width, wind 20%
+    # wspace=0 REMOVES the gap between plots
+    gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0)
     
     # 1. Skew-T Panel
     ax_skew = fig.add_subplot(gs[0])
     skew = SkewT(fig, rotation=45, subplot=ax_skew)
     
-    # Plot Data
     skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
     skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa)[::3], u[::3], v[::3])
+    skew.plot_barbs(p.to(units.hPa)[::4], u[::4], v[::4]) # [::4] to reduce barb density
     
-    # Decorations
     skew.plot_dry_adiabats(alpha=0.1, color='red')
     skew.plot_moist_adiabats(alpha=0.1, color='blue')
     skew.plot_mixing_lines(alpha=0.1, color='green')
     
-    # Set Limits (Standard 1050-100 hPa)
     skew.ax.set_ylim(1050, 100)
-    skew.ax.set_xlim(-40, 40)
+    skew.ax.set_xlim(-35, 35) # Tighter limits help the aspect ratio
     
-    # --- Altitude Axis (Left) ---
-    # Hide the default pressure labels on the left
+    # --- Altitude Axis (Left side of Skew-T) ---
+    # Hide original pressure labels
     skew.ax.yaxis.set_major_formatter(plt.NullFormatter())
-    skew.ax.set_ylabel("") # Remove 'hPa' label
     
-    # Create the secondary axis for meters
-    # We use the conversion functions defined above
+    # Add Altitude Axis
     secax = skew.ax.secondary_yaxis('left', functions=(p_to_h, h_to_p))
-    secax.set_ylabel('Altitude [m]', fontsize=12)
-    
-    # Force specific ticks to ensure they appear
-    # We generate ticks from 0m to 16000m every 1000m or 2000m
-    alt_ticks = np.arange(0, 17000, 1000)
-    secax.set_yticks(alt_ticks)
+    secax.set_ylabel('Altitude [m]', fontsize=11)
+    # Define ticks every 1000m
+    secax.yaxis.set_major_locator(ticker.MultipleLocator(1000))
     secax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
     secax.tick_params(axis='y', length=6, direction='out')
 
@@ -150,23 +143,19 @@ def main():
     skew.ax.legend(loc='upper left')
 
     # 2. Wind Speed Panel (Right)
-    # sharey ensures the vertical axis (Pressure) matches exactly
+    # sharey=skew.ax ensures they match exactly in length and scale
     ax_wind = fig.add_subplot(gs[1], sharey=skew.ax)
     
-    # Plot wind speed (X) vs Pressure (Y)
     ax_wind.plot(wind_speed, p.to(units.hPa), 'b-', linewidth=2)
-    
-    # Setup Wind Axis
     ax_wind.set_xlabel('Wind [km/h]', fontsize=10)
     ax_wind.grid(True)
     
-    # Hide Y-axis labels/ticks on the wind plot (it shares the Skew-T's scale)
+    # Hide Y-axis labels on the wind plot so they don't overlap the Skew-T lines
     plt.setp(ax_wind.get_yticklabels(), visible=False)
     
-    # Optional: Add a few minor ticks or gridlines for wind clarity
-    ax_wind.xaxis.set_major_locator(ticker.MaxNLocator(nbins=4))
+    # Optional: Fix wind x-axis to reasonable limits so it doesn't auto-scale weirdly
+    # ax_wind.set_xlim(0, 150) # Uncomment if you want fixed wind range
 
-    # Save
     plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
     print("Success! Skew-T saved.")
 
