@@ -1,0 +1,20 @@
+name: Daily Weather Plot
+on:
+  schedule:
+    - cron: '0 6 * * *' # Runs every day at 06:00 UTC
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run script
+        run: python generate_skewt.py
+      - name: Upload Plot
+        uses: actions/upload-artifact@v2
+        with:
+          name: weather-plots
+          path: "*.png"
