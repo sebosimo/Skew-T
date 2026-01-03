@@ -13,7 +13,16 @@ CORE_VARS = ["T", "U", "V", "P"]
 
 def get_nearest_profile(ds, lat_target, lon_target):
     """Robustly extracts a 1D vertical profile from the ICON grid."""
-    data = ds if isinstance(ds, xr.DataArray) else ds[list(ds.data_vars)[0]]
+    if ds is None:
+        return None
+        
+    data = ds if isinstance(ds, xr.DataArray) else None
+    if data is None and hasattr(ds, 'data_vars') and len(ds.data_vars) > 0:
+        data = ds[list(ds.data_vars)[0]]
+    
+    if data is None:
+        return None
+
     # Handle varying coordinate names
     lat_dim = 'latitude' if 'latitude' in data.coords else 'lat'
     lon_dim = 'longitude' if 'longitude' in data.coords else 'lon'
@@ -24,7 +33,7 @@ def get_nearest_profile(ds, lat_target, lon_target):
     
     # Select the point, compute it, and SQUEEZE to ensure 1D array for MetPy
     profile = data.stack(gp=data.dims[-2:]).isel(gp=flat_idx).compute()
-    return profile.squeeze() # Removes singleton dims like (1, 1, 60) -> (60,)
+    return profile.squeeze()
 
 def main():
     print("Connecting to MeteoSwiss for ICON-CH1...")
@@ -34,43 +43,50 @@ def main():
     base_hour = (now.hour // 3) * 3
     latest_standard = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
-    # Try the most recent runs (up to 9 hours back)
-    times_to_try = [latest_standard - datetime.timedelta(hours=i*3) for i in range(4)]
+    # Try the most recent runs (up to 12 hours back)
+    times_to_try = [latest_standard - datetime.timedelta(hours=i*3) for i in range(5)]
     
     success = False
+    ref_time_final = None
     for ref_time in times_to_try:
         print(f"--- Attempting Run: {ref_time.strftime('%Y-%m-%d %H:%M')} UTC ---")
         profile_data = {}
         try:
-            # Fetch core vertical variables (T, U, V, Pressure)
+            # Fetch core vertical variables
             for var in CORE_VARS:
                 req = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=var,
                                       reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
-                profile_data[var] = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
+                res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
+                if res is None:
+                    raise ValueError(f"Data for {var} is empty.")
+                profile_data[var] = res
             
-            # Fetch Humidity (try multiple common variable names)
+            # Fetch Humidity (try multiple common names)
             for hum_var in ["RELHUM", "QV", "RH"]:
                 try:
                     req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
                                             reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
-                    profile_data["HUM"] = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
-                    profile_data["HUM_TYPE"] = hum_var
-                    break
+                    res_h = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
+                    if res_h is not None:
+                        profile_data["HUM"] = res_h
+                        profile_data["HUM_TYPE"] = hum_var
+                        break
                 except: continue
             
-            if "HUM" not in profile_data: raise ValueError("Missing Humidity data.")
+            if "HUM" not in profile_data: 
+                raise ValueError("Missing Humidity data.")
             
             success = True
-            break # Exit loop once a complete run is found
+            ref_time_final = ref_time
+            break 
         except Exception as e:
-            print(f"Run incomplete: {e}")
+            print(f"Run incomplete or failed: {e}")
 
     if not success:
         print("Error: Could not find any complete model runs.")
         return
 
     # --- Unit Conversion ---
-    # Convert ICON native units (Pa, K) to standard units
     p = profile_data["P"].values * units.Pa
     t = profile_data["T"].values * units.K
     u = profile_data["U"].values * units('m/s')
@@ -85,10 +101,12 @@ def main():
     fig = plt.figure(figsize=(10, 10))
     skew = SkewT(fig, rotation=45)
     
-    # MetPy now receives clean 1D arrays
+    # MetPy plot calls - removed problematic x_loc
     skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
     skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa), u, v, x_loc=1.05)
+    
+    # Plot wind barbs (they default to the right side automatically)
+    skew.plot_barbs(p.to(units.hPa), u, v)
     
     skew.plot_dry_adiabats(alpha=0.15, color='orangered', linestyle='--')
     skew.plot_moist_adiabats(alpha=0.15, color='blue', linestyle='--')
@@ -97,7 +115,7 @@ def main():
     skew.ax.set_ylim(1050, 100)
     skew.ax.set_xlim(-30, 30)
     
-    plt.title(f"ICON-CH1 Skew-T | {ref_time.strftime('%Y-%m-%d %H:%M')} UTC\nLat: {LAT_TARGET}, Lon: {LON_TARGET}", fontsize=14)
+    plt.title(f"ICON-CH1 Skew-T | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC\nLat: {LAT_TARGET}, Lon: {LON_TARGET}", fontsize=14)
     plt.legend(loc='upper left')
     plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
     print("Success! Skew-T saved as latest_skewt.png")
