@@ -6,104 +6,153 @@ from meteodatalab import ogd_api
 import xarray as xr
 import numpy as np
 import datetime
+import matplotlib.gridspec as gridspec
 
 # --- Configuration ---
-LAT, LON = 46.81, 6.94  # Payerne
-# CORE_VARS must include 'FI' (Geopotential) for altitude calculation
-VARIABLES = ["T", "RELHUM", "U", "V", "P", "FI"] 
+LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
+CORE_VARS = ["T", "U", "V", "P"] 
 
 def get_nearest_profile(ds, lat_target, lon_target):
-    """Safely extracts a vertical profile using the user's working architecture."""
+    """Correctly extracts a vertical profile from regular or native ICON grids."""
     if ds is None: return None
+    data = ds if isinstance(ds, xr.DataArray) else ds[list(ds.data_vars)[0]]
     
-    # FIX: Handle cases where the API returns a DataArray instead of a Dataset
-    if isinstance(ds, xr.Dataset):
-        if not ds.data_vars: return None
-        data = ds[list(ds.data_vars)[0]]
-    else:
-        data = ds
-
-    # Finding nearest point using the architecture that worked previously
-    lat_dim = 'latitude' if 'latitude' in data.coords else 'lat'
-    lon_dim = 'longitude' if 'longitude' in data.coords else 'lon'
-    dist = (data[lat_dim] - lat_target)**2 + (data[lon_dim] - lon_target)**2
+    # 1. Identify coordinate and dimension names
+    lat_coord = 'latitude' if 'latitude' in data.coords else 'lat'
+    lon_coord = 'longitude' if 'longitude' in data.coords else 'lon'
+    
+    # 2. Find the horizontal dimension (usually 'ncells' or 'grid_index')
+    horiz_dims = data.coords[lat_coord].dims
+    
+    # 3. Calculate distance to find the closest horizontal point
+    dist = (data[lat_coord] - lat_target)**2 + (data[lon_coord] - lon_target)**2
     flat_idx = dist.argmin().values
     
-    # Stack horizontal dims (last two) and select index
-    profile = data.stack(gp=data.dims[-2:]).isel(gp=flat_idx).squeeze().compute()
-    return profile
+    # 4. Extract column: select the index on the horizontal dimension only
+    if len(horiz_dims) == 1:
+        # Native ICON Grid (1D horizontal)
+        profile = data.isel({horiz_dims[0]: flat_idx})
+    else:
+        # Regular Grid (2D horizontal)
+        profile = data.stack(gp=horiz_dims).isel(gp=flat_idx)
+        
+    return profile.squeeze().compute()
+
+# --- Axis Conversion Functions (Standard Atmosphere) ---
+def p_to_h(p):
+    """Convert pressure (hPa) to height (m) using Standard Atmosphere."""
+    # Ensure input is treated as hPa and return unitless meters
+    return mpcalc.pressure_to_height_std(p * units.hPa).m_as(units.m)
+
+def h_to_p(h):
+    """Convert height (m) to pressure (hPa) using Standard Atmosphere."""
+    # Ensure input is treated as meters and return unitless hPa
+    return mpcalc.height_to_pressure_std(h * units.m).m_as(units.hPa)
 
 def main():
-    print("Connecting to MeteoSwiss (Stable Architecture + New Features)...")
+    print("Fetching ICON-CH1 data from MeteoSwiss...")
     now = datetime.datetime.now(datetime.timezone.utc)
-    base_h = (now.hour // 3) * 3
-    latest_standard = now.replace(hour=base_h, minute=0, second=0, microsecond=0)
+    base_hour = (now.hour // 3) * 3
+    latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
-    # Fallback logic: check 'latest', then standard runs
-    times_to_try = ["latest"] + [latest_standard - datetime.timedelta(hours=i*3) for i in range(4)]
+    # Try the last 4 runs to find complete data
+    times_to_try = [latest_run - datetime.timedelta(hours=i*3) for i in range(4)]
     
-    success, profile_data, final_run_time = False, {}, None
+    success, profile_data, ref_time_final = False, {}, None
     for ref_time in times_to_try:
-        print(f"--- Attempting Run: {ref_time} ---")
+        print(f"--- Attempting Run: {ref_time.strftime('%H:%M')} UTC ---")
         try:
-            batch = {}
-            for var in VARIABLES:
+            for var in CORE_VARS:
                 req = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=var,
-                                      reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
-                res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT, LON)
-                if res is None: raise ValueError(f"Empty {var}")
-                batch[var] = res
+                                    reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
+                res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
+                if res is None or res.size < 5: raise ValueError(f"Empty {var}")
+                profile_data[var] = res
             
-            profile_data, success, final_run_time = batch, True, ref_time
-            break
+            # Fetch Humidity with fallback
+            for hum_var in ["RELHUM", "QV"]:
+                try:
+                    req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
+                                          reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
+                    res_h = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
+                    if res_h is not None and res_h.size >= 5:
+                        profile_data["HUM"], profile_data["HUM_TYPE"] = res_h, hum_var
+                        break
+                except: continue
+            
+            if "HUM" not in profile_data: raise ValueError("No Humidity")
+            success, ref_time_final = True, ref_time
+            break 
         except Exception as e: print(f"Run incomplete: {e}")
 
-    if not success: return
+    if not success:
+        print("Error: No complete model runs found.")
+        return
 
-    # --- Processing Data ---
+    # --- Unit Conversion & Sorting ---
     p = profile_data["P"].values * units.Pa
     t = profile_data["T"].values * units.K
-    u, v = profile_data["U"].values * units('m/s'), profile_data["V"].values * units('m/s')
-    # Height in meters = Geopotential / standard gravity
-    h = (profile_data["FI"].values * units('m^2/s^2') / (9.80665 * units('m/s^2'))).to(units.m)
-    rh = profile_data["RELHUM"].values / 100.0
+    u = profile_data["U"].values * units('m/s')
+    v = profile_data["V"].values * units('m/s')
     
-    td = mpcalc.dewpoint_from_relative_humidity(t, rh)
-    wind_speed = mpcalc.wind_speed(u, v).to(units.knot)
+    # Calculate Wind Speed
+    wind_speed = mpcalc.wind_speed(u, v).to(units('km/h'))
 
-    # Sort ground-to-sky (descending pressure)
-    inds = p.argsort()[::-1]
-    p, t, td, u, v, h, wind_speed = p[inds], t[inds], td[inds], u[inds], v[inds], h[inds], wind_speed[inds]
+    if profile_data["HUM_TYPE"] == "RELHUM":
+        td = mpcalc.dewpoint_from_relative_humidity(t, profile_data["HUM"].values / 100.0)
+    else:
+        td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
 
-    # --- Multi-Panel Plotting ---
-    fig = plt.figure(figsize=(12, 10))
-    # Main Skew-T Panel
-    skew = SkewT(fig, rotation=45, rect=(0.1, 0.1, 0.65, 0.85))
-    skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temp')
+    inds = p.argsort()[::-1] # Sort descending (1000hPa -> 100hPa)
+    p, t, td, u, v, wind_speed = p[inds], t[inds], td[inds], u[inds], v[inds], wind_speed[inds]
+
+    # --- Plotting ---
+    # Setup Figure and Grid (SkewT on left, Wind Speed on right)
+    fig = plt.figure(figsize=(14, 12))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1], wspace=0.1)
+    
+    # 1. Skew-T Panel
+    ax_skew = fig.add_subplot(gs[0])
+    skew = SkewT(fig, rotation=45, subplot=ax_skew)
+    
+    # Plot Data
+    skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
     skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa)[::5], u[::5], v[::5]) #
+    skew.plot_barbs(p.to(units.hPa)[::3], u[::3], v[::3])
     
-    # Add Altitude Markers (m) to the pressure axis
-    for height in [1000, 2000, 3000, 5000, 7000, 9000]:
-        idx = (np.abs(h.m - height)).argmin()
-        if p[idx].to(units.hPa).m > 120:
-            skew.ax.text(-38, p[idx].to(units.hPa).m, f"{height}m", color='blue', alpha=0.6, ha='right', weight='bold')
-
+    # Skew-T Decorations
+    skew.plot_dry_adiabats(alpha=0.1, color='red')
+    skew.plot_moist_adiabats(alpha=0.1, color='blue')
+    skew.plot_mixing_lines(alpha=0.1, color='green')
+    
     skew.ax.set_ylim(1050, 100)
     skew.ax.set_xlim(-40, 40)
-    skew.ax.set_ylabel("Pressure (hPa) / Altitude (m)")
+    
+    # --- Modify Axis: Altitude instead of Pressure ---
+    # Hide original pressure labels
+    skew.ax.yaxis.set_major_formatter(plt.NullFormatter())
+    
+    # Create Secondary Axis for Altitude (Meters) on the left
+    # functions=(forward, inverse) maps Pressure <-> Height
+    secax = skew.ax.secondary_yaxis('left', functions=(p_to_h, h_to_p))
+    secax.set_ylabel('Altitude [m]', fontsize=12)
+    secax.tick_params(axis='y', length=6, width=1)
+    
+    plt.title(f"ICON-CH1 Sounding | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=14)
+    skew.ax.legend(loc='upper left')
 
-    # Wind Speed Panel (Right)
-    ax_wind = fig.add_axes([0.78, 0.1, 0.18, 0.85], sharey=skew.ax)
-    ax_wind.plot(wind_speed, p.to(units.hPa), 'blue', linewidth=1.8)
-    ax_wind.set_xlabel("Speed (kt)")
-    ax_wind.grid(True, alpha=0.3)
-    ax_wind.set_xlim(0, max(50, wind_speed.m.max() + 10))
+    # 2. Wind Speed Panel (Right)
+    ax_wind = fig.add_subplot(gs[1], sharey=skew.ax)
+    ax_wind.plot(wind_speed, p.to(units.hPa), 'b-', linewidth=2)
+    ax_wind.set_xlabel('Wind Speed [km/h]', fontsize=12)
+    ax_wind.grid(True)
+    
+    # Hide Y-axis labels for wind plot (since it shares with Skew-T)
     plt.setp(ax_wind.get_yticklabels(), visible=False)
-
-    plt.suptitle(f"ICON-CH1 Sounding | Run: {final_run_time} UTC", fontsize=15, weight='bold')
+    
+    # Final adjustments
     plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
-    print("Success! saved latest_skewt.png")
+    print("Success! Skew-T saved.")
 
 if __name__ == "__main__":
     main()
