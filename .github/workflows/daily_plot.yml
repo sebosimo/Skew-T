@@ -1,7 +1,8 @@
 name: Daily Weather Plot
 on:
+  workflow_dispatch:  # This adds a manual "Run" button
   schedule:
-    - cron: '0 6 * * *' # Runs every day at 06:00 UTC
+    - cron: '0 6 * * *'
 jobs:
   build:
     runs-on: ubuntu-latest
