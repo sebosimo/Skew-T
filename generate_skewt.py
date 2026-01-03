@@ -8,55 +8,58 @@ import numpy as np
 import datetime
 
 # --- Configuration ---
-LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne sounding station
+LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
 CORE_VARS = ["T", "U", "V", "P"] 
 
 def get_nearest_profile(ds, lat_target, lon_target):
-    """Extracts a 1D vertical profile, ensuring extra dimensions are removed."""
+    """Correctly extracts a vertical profile from regular or native ICON grids."""
     if ds is None: return None
+    data = ds if isinstance(ds, xr.DataArray) else ds[list(ds.data_vars)[0]]
     
-    # Extract the actual data variable (e.g., 't' or 'p')
-    data = ds if isinstance(ds, xr.DataArray) else None
-    if data is None and hasattr(ds, 'data_vars') and len(ds.data_vars) > 0:
-        data = ds[list(ds.data_vars)[0]]
+    # 1. Identify coordinate and dimension names
+    lat_coord = 'latitude' if 'latitude' in data.coords else 'lat'
+    lon_coord = 'longitude' if 'longitude' in data.coords else 'lon'
     
-    if data is None: return None
-
-    # Handle native ICON grid coordinate names
-    lat_dim = 'latitude' if 'latitude' in data.coords else 'lat'
-    lon_dim = 'longitude' if 'longitude' in data.coords else 'lon'
+    # 2. Find the horizontal dimension (usually 'ncells' or 'grid_index')
+    horiz_dims = data.coords[lat_coord].dims
     
-    # Calculate distance to find nearest grid point
-    dist = (data[lat_dim] - lat_target)**2 + (data[lon_dim] - lon_target)**2
+    # 3. Calculate distance to find the closest horizontal point
+    dist = (data[lat_coord] - lat_target)**2 + (data[lon_coord] - lon_target)**2
     flat_idx = dist.argmin().values
     
-    # Stack horizontal dims, select point, and SQUEEZE to force a 1D array
-    # We use .flatten() to ensure MetPy gets a clean 1D vector
-    profile = data.stack(gp=data.dims[-2:]).isel(gp=flat_idx).compute()
-    return profile.squeeze()
+    # 4. Extract column: select the index on the horizontal dimension only
+    # This keeps all levels in the vertical dimension(s)
+    if len(horiz_dims) == 1:
+        # Native ICON Grid (1D horizontal)
+        profile = data.isel({horiz_dims[0]: flat_idx})
+    else:
+        # Regular Grid (2D horizontal)
+        profile = data.stack(gp=horiz_dims).isel(gp=flat_idx)
+        
+    return profile.squeeze().compute()
 
 def main():
-    print("Connecting to MeteoSwiss for ICON-CH1 Skew-T...")
+    print("Fetching ICON-CH1 data from MeteoSwiss...")
     now = datetime.datetime.now(datetime.timezone.utc)
     base_hour = (now.hour // 3) * 3
     latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
     
-    # Try current and previous 3-hourly runs to find complete data
+    # Try the last 4 runs to find complete data
     times_to_try = [latest_run - datetime.timedelta(hours=i*3) for i in range(4)]
     
     success, profile_data, ref_time_final = False, {}, None
     for ref_time in times_to_try:
-        print(f"--- Checking Model Run: {ref_time.strftime('%Y-%m-%d %H:%M')} UTC ---")
+        print(f"--- Attempting Run: {ref_time.strftime('%H:%M')} UTC ---")
         try:
             for var in CORE_VARS:
                 req = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=var,
                                       reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
                 res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
-                if res is None or res.size < 5: raise ValueError(f"Variable {var} has insufficient levels.")
+                if res is None or res.size < 5: raise ValueError(f"Empty {var}")
                 profile_data[var] = res
             
             # Fetch Humidity with fallback
-            for hum_var in ["RELHUM", "QV", "RH"]:
+            for hum_var in ["RELHUM", "QV"]:
                 try:
                     req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
                                             reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
@@ -66,42 +69,37 @@ def main():
                         break
                 except: continue
             
-            if "HUM" not in profile_data: raise ValueError("No vertical humidity profile found.")
+            if "HUM" not in profile_data: raise ValueError("No Humidity")
             success, ref_time_final = True, ref_time
             break 
         except Exception as e: print(f"Run incomplete: {e}")
 
     if not success:
-        print("Error: Could not find a run with full vertical profiles.")
+        print("Error: No complete model runs found.")
         return
 
-    # --- Unit Conversion and Data Validation ---
+    # --- Unit Conversion & Sorting ---
+    # Sort ground-to-sky by pressure for correct rendering
     p = profile_data["P"].values * units.Pa
     t = profile_data["T"].values * units.K
     u = profile_data["U"].values * units('m/s')
     v = profile_data["V"].values * units('m/s')
     
-    # Print debug info to GitHub log
-    print(f"Levels found: {len(p)} | Surface Pressure: {p[0].to(units.hPa):.1f}")
-    print(f"Surface Temp: {t[0].to(units.degC):.1f} | Min Temp: {t.min().to(units.degC):.1f}")
-
     if profile_data["HUM_TYPE"] == "RELHUM":
         td = mpcalc.dewpoint_from_relative_humidity(t, profile_data["HUM"].values / 100.0)
     else:
         td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
 
-    # Sort data by pressure (Required for some MetPy calculations)
-    inds = p.argsort()[::-1] # Ensure descending pressure (ground to sky)
+    inds = p.argsort()[::-1] # Sort descending (1000hPa -> 100hPa)
     p, t, td, u, v = p[inds], t[inds], td[inds], u[inds], v[inds]
 
     # --- Plotting ---
     fig = plt.figure(figsize=(10, 12))
     skew = SkewT(fig, rotation=45)
     
-    # Plot data with standardized MetPy calls
     skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
     skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa)[::2], u[::2], v[::2]) # Decimate barbs for clarity
+    skew.plot_barbs(p.to(units.hPa)[::3], u[::3], v[::3]) # Decimate for clarity
     
     skew.plot_dry_adiabats(alpha=0.1, color='red')
     skew.plot_moist_adiabats(alpha=0.1, color='blue')
@@ -109,11 +107,10 @@ def main():
     
     skew.ax.set_ylim(1050, 100)
     skew.ax.set_xlim(-40, 40)
-    
-    plt.title(f"ICON-CH1 Sounding | Run: {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC\nLat: {LAT_TARGET}, Lon: {LON_TARGET}", fontsize=14)
+    plt.title(f"ICON-CH1 Sounding | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=14)
     plt.legend(loc='upper left')
     plt.savefig("latest_skewt.png", bbox_inches='tight', dpi=150)
-    print("Success! Plot saved.")
+    print("Success! Skew-T saved.")
 
 if __name__ == "__main__":
     main()
