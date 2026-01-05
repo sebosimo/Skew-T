@@ -10,11 +10,12 @@ import xarray as xr
 import numpy as np
 import datetime
 
-# --- Configuration ---\nLAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
-CORE_VARS = [\"T\", \"U\", \"V\", \"P\"]
+# --- Configuration ---
+LAT_TARGET, LON_TARGET = 46.81, 6.94  # Payerne
+CORE_VARS = ["T", "U", "V", "P"]
 
 def get_nearest_profile(ds, lat_target, lon_target):
-    \"\"\"Correctly extracts a vertical profile from regular or native ICON grids.\"\"\"
+    """Correctly extracts a vertical profile from regular or native ICON grids."""
     if ds is None: return None
     data = ds if isinstance(ds, xr.DataArray) else ds[list(ds.data_vars)[0]]
     
@@ -38,19 +39,19 @@ def get_nearest_profile(ds, lat_target, lon_target):
     return profile.squeeze().compute()
 
 def format_pressure_as_meters(x, pos):
-    \"\"\"
+    """
     Callback function for matplotlib ticker.
     Converts Y-axis Pressure (x in hPa) to Standard Atmosphere Height (Meters).
-    \"\"\"
+    """
     # Avoid log(0) or negative errors if plot limits get weird
-    if x <= 0: return \"\"
+    if x <= 0: return ""
     
     # Calculate standard height from pressure
     height = mpcalc.pressure_to_height_std(x * units.hPa)
-    return f\"{int(height.m)}\"
+    return f"{int(height.m)}"
 
 def main():
-    print(\"Fetching ICON-CH1 data from MeteoSwiss...\")
+    print("Fetching ICON-CH1 data from MeteoSwiss...")
     now = datetime.datetime.now(datetime.timezone.utc)
     base_hour = (now.hour // 3) * 3
     latest_run = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
@@ -60,46 +61,46 @@ def main():
     
     success, profile_data, ref_time_final = False, {}, None
     for ref_time in times_to_try:
-        print(f\"--- Attempting Run: {ref_time.strftime('%H:%M')} UTC ---\")
+        print(f"--- Attempting Run: {ref_time.strftime('%H:%M')} UTC ---")
         try:
             for var in CORE_VARS:
-                req = ogd_api.Request(collection=\"ogd-forecasting-icon-ch1\", variable=var,
-                                      reference_datetime=ref_time, horizon=\"P0DT0H\", perturbed=False)
+                req = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=var,
+                                      reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
                 res = get_nearest_profile(ogd_api.get_from_ogd(req), LAT_TARGET, LON_TARGET)
-                if res is None or res.size < 5: raise ValueError(f\"Empty {var}\")
+                if res is None or res.size < 5: raise ValueError(f"Empty {var}")
                 profile_data[var] = res
             
             # Fetch Humidity with fallback
-            for hum_var in [\"RELHUM\", \"QV\"]:
+            for hum_var in ["RELHUM", "QV"]:
                 try:
-                    req_h = ogd_api.Request(collection=\"ogd-forecasting-icon-ch1\", variable=hum_var,
-                                            reference_datetime=ref_time, horizon=\"P0DT0H\", perturbed=False)
+                    req_h = ogd_api.Request(collection="ogd-forecasting-icon-ch1", variable=hum_var,
+                                            reference_datetime=ref_time, horizon="P0DT0H", perturbed=False)
                     res_h = get_nearest_profile(ogd_api.get_from_ogd(req_h), LAT_TARGET, LON_TARGET)
                     if res_h is not None and res_h.size >= 5:
-                        profile_data[\"HUM\"], profile_data[\"HUM_TYPE\"] = res_h, hum_var
+                        profile_data["HUM"], profile_data["HUM_TYPE"] = res_h, hum_var
                         break
                 except: continue
             
-            if \"HUM\" not in profile_data: raise ValueError(\"No Humidity\")
+            if "HUM" not in profile_data: raise ValueError("No Humidity")
             success, ref_time_final = True, ref_time
             break 
-        except Exception as e: print(f\"Run incomplete: {e}\")
+        except Exception as e: print(f"Run incomplete: {e}")
 
     if not success:
-        print(\"Error: No complete model runs found.\")
+        print("Error: No complete model runs found.")
         return
 
     # --- Unit Conversion & Calculation ---
-    p = profile_data[\"P\"].values * units.Pa
-    t = profile_data[\"T\"].values * units.K
-    u = profile_data[\"U\"].values * units('m/s')
-    v = profile_data[\"V\"].values * units('m/s')
+    p = profile_data["P"].values * units.Pa
+    t = profile_data["T"].values * units.K
+    u = profile_data["U"].values * units('m/s')
+    v = profile_data["V"].values * units('m/s')
     
     # Calculate Dewpoint
-    if profile_data[\"HUM_TYPE\"] == \"RELHUM\":
-        td = mpcalc.dewpoint_from_relative_humidity(t, profile_data[\"HUM\"].values / 100.0)
+    if profile_data["HUM_TYPE"] == "RELHUM":
+        td = mpcalc.dewpoint_from_relative_humidity(t, profile_data["HUM"].values / 100.0)
     else:
-        td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data[\"HUM\"].values * units('kg/kg'))
+        td = mpcalc.dewpoint_from_specific_humidity(p, t, profile_data["HUM"].values * units('kg/kg'))
 
     # Calculate Wind Speed in km/h
     wind_speed = mpcalc.wind_speed(u, v).to(units('km/h'))
@@ -135,7 +136,7 @@ def main():
     ax_wind.plot(wind_speed, p.to(units.hPa), color='purple', linewidth=2)
     
     # Formatting the Wind Panel
-    ax_wind.set_xlabel(\"Wind Speed [km/h]\")
+    ax_wind.set_xlabel("Wind Speed [km/h]")
     ax_wind.grid(True, which='both', linestyle='--', alpha=0.5)
     
     # IMPORTANT: Ensure the wind plot is also Logarithmic to match Skew-T projection
@@ -146,7 +147,7 @@ def main():
     
     # 3. Y-Axis Label Transformation (hPa -> Meters)
     # We apply this to the Skew-T's Y-axis
-    skew.ax.set_ylabel(\"Altitude (m) [Std. Atm]\")
+    skew.ax.set_ylabel("Altitude (m) [Std. Atm]")
     
     # Set standard pressure ticks but label them as Height
     pressure_levels = [1000, 900, 850, 800, 700, 600, 500, 400, 300, 200, 150, 100]
@@ -160,12 +161,12 @@ def main():
     plt.subplots_adjust(wspace=0)
 
     # Title & Save
-    plt.suptitle(f\"ICON-CH1 Sounding (Payerne) | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC\", fontsize=16, y=0.92)
+    plt.suptitle(f"ICON-CH1 Sounding (Payerne) | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=16, y=0.92)
     skew.ax.legend(loc='upper left')
     
-    output_filename = \"latest_skewt.png\"
+    output_filename = "latest_skewt.png"
     plt.savefig(output_filename, bbox_inches='tight', dpi=150)
-    print(f\"Success! {output_filename} saved.\")
+    print(f"Success! {output_filename} saved.")
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     main()
