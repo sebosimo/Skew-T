@@ -110,19 +110,20 @@ def main():
     p, t, td, u, v, wind_speed = p[inds], t[inds], td[inds], u[inds], v[inds], wind_speed[inds]
 
     # --- Plotting Setup ---
-    # Create a figure with GridSpec: 2 columns, Skew-T is wider (3:1 ratio)
+    # Create a figure with GridSpec: 2 columns, Skew-T is wider
     fig = plt.figure(figsize=(14, 12))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1]) 
-    
+    gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0.0)
+
     # 1. Skew-T Panel (Left)
-    # We pass the gridspec slot to the subplot argument
     skew = SkewT(fig, rotation=45, subplot=gs[0])
+
+    # Plot standard Skew-T layers with zorder
+    skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature', zorder=2)
+    skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint', zorder=2)
     
-    # Plot standard Skew-T layers
-    skew.plot(p.to(units.hPa), t.to(units.degC), 'r', linewidth=2.5, label='Temperature')
-    skew.plot(p.to(units.hPa), td.to(units.degC), 'g', linewidth=2.5, label='Dewpoint')
-    skew.plot_barbs(p.to(units.hPa)[::5], u[::5], v[::5]) # [::5] makes barbs less crowded
-    
+    # Plot barbs on top with a higher zorder
+    skew.plot_barbs(p.to(units.hPa)[::5], u[::5], v[::5], zorder=3)
+
     skew.plot_dry_adiabats(alpha=0.1, color='red')
     skew.plot_moist_adiabats(alpha=0.1, color='blue')
     skew.plot_mixing_lines(alpha=0.1, color='green')
@@ -132,34 +133,31 @@ def main():
     skew.ax.set_xlim(-40, 40)
     
     # 2. Wind Speed Panel (Right)
-    ax_wind = fig.add_subplot(gs[1], sharey=skew.ax) # sharey locks the Y-axis to the Skew-T
+    ax_wind = fig.add_subplot(gs[1], sharey=skew.ax)
     ax_wind.plot(wind_speed, p.to(units.hPa), color='purple', linewidth=2)
     
     # Formatting the Wind Panel
     ax_wind.set_xlabel("Wind Speed [km/h]")
     ax_wind.grid(True, which='both', linestyle='--', alpha=0.5)
     
-    # IMPORTANT: Ensure the wind plot is also Logarithmic to match Skew-T projection
+    # Ensure the wind plot is also Logarithmic to match Skew-T projection
     ax_wind.set_yscale('log')
-    
-    # Hide the Y-axis labels of the wind plot (since they are shared and adjacent)
+    ax_wind.set_ylim(1050, 100)
+
+    # Hide the Y-axis labels of the wind plot
     plt.setp(ax_wind.get_yticklabels(), visible=False)
     
     # 3. Y-Axis Label Transformation (hPa -> Meters)
-    # We apply this to the Skew-T's Y-axis
     skew.ax.set_ylabel("Altitude (m) [Std. Atm]")
     
     # Set standard pressure ticks but label them as Height
     pressure_levels = [1000, 900, 850, 800, 700, 600, 500, 400, 300, 200, 150, 100]
     skew.ax.set_yticks(pressure_levels)
-    skew.ax.set_yticklabels(pressure_levels) # Set numerical values first to init formatters
+    skew.ax.set_yticklabels(pressure_levels)
     
-    # Apply the custom formatter to convert hPa ticks to Meter strings
+    # Apply the custom formatter
     skew.ax.yaxis.set_major_formatter(FuncFormatter(format_pressure_as_meters))
     
-    # Remove space between plots
-    plt.subplots_adjust(wspace=0)
-
     # Title & Save
     plt.suptitle(f"ICON-CH1 Sounding (Payerne) | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=16, y=0.92)
     skew.ax.legend(loc='upper left')
