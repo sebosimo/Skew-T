@@ -38,17 +38,14 @@ def get_nearest_profile(ds, lat_target, lon_target):
         
     return profile.squeeze().compute()
 
-def format_pressure_as_meters(x, pos):
+def format_pressure_as_km(x, pos):
     """
     Callback function for matplotlib ticker.
-    Converts Y-axis Pressure (x in hPa) to Standard Atmosphere Height (Meters).
+    Converts Y-axis Pressure (x in hPa) to Standard Atmosphere Height (km).
     """
-    # Avoid log(0) or negative errors if plot limits get weird
     if x <= 0: return ""
-    
-    # Calculate standard height from pressure
-    height = mpcalc.pressure_to_height_std(x * units.hPa)
-    return f"{int(height.m)}"
+    height = mpcalc.pressure_to_height_std(x * units.hPa).to('km')
+    return f"{height.m:.1f}"
 
 def main():
     print("Fetching ICON-CH1 data from MeteoSwiss...")
@@ -147,16 +144,15 @@ def main():
     # Hide the Y-axis labels of the wind plot
     plt.setp(ax_wind.get_yticklabels(), visible=False)
     
-    # 3. Y-Axis Label Transformation (hPa -> Meters)
-    skew.ax.set_ylabel("Altitude (m) [Std. Atm]")
+    # 3. Y-Axis Label Transformation (hPa -> km)
+    skew.ax.set_ylabel("Altitude (km) [Std. Atm]")
     
-    # Set standard pressure ticks but label them as Height
-    pressure_levels = [1000, 900, 850, 800, 700, 600, 500, 400, 300, 200, 150, 100]
+    # Set standard pressure ticks
+    pressure_levels = [1000, 850, 700, 500, 400, 300, 200, 100]
     skew.ax.set_yticks(pressure_levels)
-    skew.ax.set_yticklabels(pressure_levels)
     
     # Apply the custom formatter
-    skew.ax.yaxis.set_major_formatter(FuncFormatter(format_pressure_as_meters))
+    skew.ax.yaxis.set_major_formatter(FuncFormatter(format_pressure_as_km))
     
     # Title & Save
     plt.suptitle(f"ICON-CH1 Sounding (Payerne) | {ref_time_final.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=16, y=0.92)
